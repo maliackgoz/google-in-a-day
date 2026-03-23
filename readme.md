@@ -20,6 +20,8 @@ The **Search** page allows users to search with a query. The query will be parse
 
 This is the core of the project. It receives a URL and depth, along with optional parameters such as number of workers, queue capacity (which defines when to pause based on queued URL pages), maximum pages to visit, and hit rate (requests per second for rate limiting).
 
+**Workers (`max_workers`) vs. the status metric "active workers".** Many sample crawlers use a single thread to do all fetching; this project uses a **configurable pool of worker threads per crawl job** (`max_workers`, default 4). Each worker runs the same loop: take the next URL from that job's shared bounded queue, fetch HTML, extract links, and enqueue new tasks up to the depth limit. **`max_workers`** is therefore the maximum **parallel** fetch-and-process pipelines for one job (subject to `hit_rate`, queue back-pressure, and how many URLs are actually available). On the **Crawler Status** page, **active workers** is a live count of how many workers are **currently busy** with a URL—not the configured cap. If the frontier is small or workers are waiting on I/O, active workers can be lower than `max_workers`.
+
 The crawler starts if all input parameters are valid. It creates a new thread to perform the job. The thread ID is used to create the crawler ID, combined with the creation time. The crawler ID is in the format `[EpochTimeCreated_ThreadID]`, where "EpochTimeCreated" is the Unix epoch time and "ThreadID" is the system-defined thread ID. As soon as the crawler ID is defined, the thread creates a file named `[crawlerId].data` that holds the crawler's status, including all logs and other details in JSON format.
 
 A crawler thread begins by reading `visited_urls.data`. If the file does not exist, an empty `visited_urls.data` file is created. This file stores each URL on a new line, allowing the crawler to check each new URL and skip it if it has already been visited. If the origin page has not been visited, the thread fetches the HTML page using Python's standard library (`urllib`). If the status is 200, it means the crawler successfully retrieved the page and continues; otherwise, it logs the error and moves on. When the crawler obtains a valid HTML page source, it retrieves the word counter (text and frequency) and a list of other URL pages. At this point, the pages are stored as visited pages, and each word is stored by its initial letter (e.g., `[letter].data`) under the `storage` folder, along with its corresponding origin URL, current URL, current depth value, and frequency count.
@@ -30,11 +32,15 @@ Rate limiting is configurable via the `hit_rate` parameter (requests per second)
 
 SSL certificate handling uses a dual-context strategy: the crawler first attempts HTTPS requests with full certificate verification, and automatically falls back to a permissive SSL context for sites with certificate issues.
 
-Crawlers support **pause/resume/stop** controls. Pausing blocks all worker threads until the crawler is resumed, while stopping signals workers to finish their current task and exit gracefully.
+Crawlers support **pause/resume/stop** controls. Pausing blocks all worker threads until the crawler is resumed, while stopping signals workers to finish their current task and exit gracefully. Crawler state is persisted in `[crawlerId].data`, and visited URLs plus the word index are written to disk as work proceeds.
+
+**Resume from disk.** When a crawler is **stopped** (interrupted), all pending URLs still in the queue are saved to a `[crawlerId].queue` snapshot file (NDJSON). The Crawler Status page then shows a **Resume from disk** button for that job. Clicking it rebuilds the job from `[crawlerId].data` (configuration, metrics, logs) and `[crawlerId].queue` (pending frontier), filtering out URLs that already appear in the visited set. The resumed crawler continues where it left off with its original settings. On the Crawler listing page, interrupted jobs also show a Resume from disk button for convenience. If the **process exits abruptly** (crash, `kill -9`), the queue snapshot is not written because the in-memory queue is lost. In that case only work already recorded in `visited_urls.data` and the letter files is retained; the visited set still prevents fetching the same normalized URL twice on a subsequent crawl.
 
 ### Search (Minor Component)
 
-When a crawler job is completed, it stores each word by its initial letter in `[letter].data`. So, when a user enters a query and clicks search, each word is checked against the files in the filesystem based on its initial letter, and each word is sorted by its frequency number. The results are then returned to the frontend with pagination.
+As pages are crawled, each word is stored by its initial letter in `[letter].data` under `data/storage`. Queries use terms of length ≥ 2. For each term we try an **exact** dictionary key first, then the **longest indexed prefix** (length ≥ 3) so minor query/index mismatches can still match without a stemmer. Hits are merged **per URL**; each row gets `total_frequency` (sum of term counts) and a **`relevance_score`** (frequency weight, bonus for exact key match, partial-match weight, and a small depth penalty—similar in spirit to a simple BM25-style heuristic). The UI and `/api/search` support **`sort=relevance|frequency|depth`** (default `relevance`). Results are paginated.
+
+Search uses the same on-disk word index the crawler updates while jobs run. There is no separate "indexing finished" gate: queries reflect pages already written, and new hits appear as workers persist content. `WordStore` uses per-letter locks so crawler threads and search requests can run concurrently without corrupting JSON files.
 
 ---
 
@@ -56,25 +62,12 @@ Then open [http://localhost:8080](http://localhost:8080) in your browser.
 
 ---
 
-### CLI Reference
-
-```
-python3 run.py [OPTIONS]
-```
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--port`, `-p` | `8080` | HTTP server port |
-| `--data-dir`, `-d` | `data` | Data directory for storage files |
-
----
-
 ### Project Layout
 
 - `crawler/indexer.py` — `CrawlerJob` (pause/resume/stop, rate limiting, SSL fallback), `CrawlerManager` (statistics, clear data), `UrlQueue`, `LinkExtractor`.
 - `storage/file_store.py` — `VisitedUrlsStore`, `WordStore`, `CrawlerDataStore` (with clear/stats support).
-- `search/searcher.py` — File-based `Searcher` with pagination.
-- `web/server.py` — HTTP server with pages + JSON API + crawler controls (pause/resume/stop/clear/stats).
+- `search/searcher.py` — File-based `Searcher` (prefix fallback, relevance score, `sort` modes, pagination).
+- `web/server.py` — HTTP server with pages + JSON API + crawler controls (pause/resume/stop/clear/stats); `/api/crawler-dashboard` feeds the live Crawler UI.
 - `utils.py` — Shared text utilities (`normalize_url`, `tokenize`, `extract_title_and_content`).
 - `run.py` — Main entry point (starts the web server).
 - `verify_system.py` — End-to-end verification script (73 automated checks).
@@ -84,6 +77,7 @@ python3 run.py [OPTIONS]
   - `visited_urls.data` — Shared visited URL set (one URL per line).
   - `storage/` — Word index files by initial letter (`a.data` … `z.data`).
   - `[crawlerId].data` — Per-crawler status, metrics, and logs in JSON format.
+  - `[crawlerId].queue` — Pending URL snapshot (NDJSON), written on stop for resume-from-disk; deleted on finish.
 
 ---
 
@@ -132,8 +126,12 @@ http://example.com/beta
   "id": "1679000000_12345",
   "origin_url": "http://example.com",
   "max_depth": 2,
+  "max_workers": 4,
+  "http_timeout": 10.0,
   "status": "finished",
   "created_at": 1679000000,
+  "updated_at": 1679000120,
+  "completed_at": 1679000120,
   "queue_capacity": 1000,
   "pages_processed": 42,
   "urls_discovered": 100,
@@ -143,23 +141,7 @@ http://example.com/beta
 }
 ```
 
----
-
-### Future
-
-For the future, many things can be added and changed for production.
-
-**Storage** needs to change to a database. For crawler data (data, queue, logs), any key-value store would work. Since we don't perform SQL operations and the data will mainly be used for reading, it's better to stick with NoSQL. For visited\_urls, this should also be in a NoSQL database with a daily batch process for analytics. For words, these should be stored in a proper Trie structure instead of by initial letter, sharded by word prefix and heavily cached.
-
-**Scaling**: The entire system can be scaled horizontally, from the database to the jobs (workers). The current project uses a single computer (node) with a filesystem. In production, crawler and search should be scaled separately. Search should be scaled for availability and speed. Crawlers should be distributed across regions for security, compliance, and speed.
-
-**Crawler limitations**: Workers can be distributed across nodes and spawn new threads when queue limits are hit. CPU/memory-based constraints, rate limiting, and politeness policies (re-visit intervals) should be added.
-
-**Search optimization**: In production, PageRank, sentence understanding, fuzzy matching (misspellings), and content relevance scoring should be incorporated.
-
-**Monitoring / Observability**: Both search and crawlers should have separate monitoring. Search metrics: DAU/MAU, click-through rate, availability, speed. Crawler metrics: unique pages/hour, update delay, active nodes. Admin metrics: cost per subsystem, database size, node count.
-
-**Security / Compliance**: Centralized configurations, rate limiting for search, DDoS protection, robots.txt compliance, and data storage based on compliance requirements.
+`updated_at` is refreshed on every state save. `completed_at` is set when the job reaches a terminal state (`finished` or `interrupted`); it is `null` while the crawl is running and cleared when resuming from disk after an interrupt.
 
 ---
 

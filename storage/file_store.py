@@ -13,7 +13,7 @@ import logging
 import os
 import threading
 from collections import Counter
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,22 @@ class VisitedUrlsStore:
     def __contains__(self, url: str) -> bool:
         with self._lock:
             return url in self._urls
+
+    def filter_unvisited(self, urls: list[str]) -> list[str]:
+        """URLs not yet visited, preserving order, deduped — **one** lock hold.
+
+        Per-link ``url in store`` in a tight loop would acquire the lock tens of
+        thousands of times on pages like Wikipedia (massive slowdown / contention).
+        """
+        with self._lock:
+            out: list[str] = []
+            batch_seen: set[str] = set()
+            for u in urls:
+                if u in self._urls or u in batch_seen:
+                    continue
+                batch_seen.add(u)
+                out.append(u)
+            return out
 
     def __len__(self) -> int:
         with self._lock:
@@ -126,7 +142,12 @@ class WordStore:
 
     def _write_file(self, letter: str, data: dict[str, list[dict]]) -> None:
         with open(self._file_path(letter), "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+            try:
+                json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+            except UnicodeEncodeError:
+                f.seek(0)
+                f.truncate()
+                json.dump(data, f, ensure_ascii=True, separators=(",", ":"))
 
     def add_words(
         self,
@@ -179,6 +200,27 @@ class WordStore:
             reverse=True,
         )
 
+    def search_with_prefix_fallback(self, word: str) -> tuple[list[dict], str]:
+        """Resolve *word* to index entries: exact key first, else longest prefix (length ≥ 3).
+
+        Returns ``(entries, matched_key)``.  If nothing matches, ``([], "")``.
+        Mirrors a lightweight “longest indexed prefix” strategy without a stemmer.
+        """
+        word = word.lower()
+        if not word:
+            return [], ""
+        rows = self.search(word)
+        if rows:
+            return rows, word
+        if len(word) < 3:
+            return [], ""
+        for i in range(len(word) - 1, 2, -1):
+            prefix = word[:i]
+            rows = self.search(prefix)
+            if rows:
+                return rows, prefix
+        return [], ""
+
     def total_words(self) -> int:
         """Count distinct words across all letter files."""
         total = 0
@@ -212,6 +254,10 @@ class CrawlerDataStore:
     def __init__(self, data_dir: str) -> None:
         self._data_dir = data_dir
         os.makedirs(data_dir, exist_ok=True)
+
+    @property
+    def data_dir(self) -> str:
+        return self._data_dir
 
     def _file_path(self, crawler_id: str) -> str:
         return os.path.join(self._data_dir, f"{crawler_id}.data")
@@ -266,3 +312,112 @@ class CrawlerDataStore:
             except FileNotFoundError:
                 pass
         return removed
+
+
+# --- Durable crawler queue & append-only logs (NDJSON + plain text) ---------
+
+_LOG_APPEND_LOCK = threading.Lock()
+
+
+def crawler_queue_path(data_dir: str, crawler_id: str) -> str:
+    return os.path.join(data_dir, f"{crawler_id}.queue")
+
+
+def crawler_log_path(data_dir: str, crawler_id: str) -> str:
+    return os.path.join(data_dir, f"{crawler_id}.logs")
+
+
+def save_crawler_queue_snapshot(
+    data_dir: str, crawler_id: str, tasks: list[dict[str, Any]],
+) -> None:
+    """Write pending crawl tasks as one JSON object per line."""
+    path = crawler_queue_path(data_dir, crawler_id)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for row in tasks:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def load_crawler_queue_snapshot(data_dir: str, crawler_id: str) -> list[dict[str, Any]]:
+    path = crawler_queue_path(data_dir, crawler_id)
+    if not os.path.exists(path):
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    return out
+
+
+def delete_crawler_queue_file(data_dir: str, crawler_id: str) -> None:
+    try:
+        os.remove(crawler_queue_path(data_dir, crawler_id))
+    except FileNotFoundError:
+        pass
+
+
+def count_crawler_queue_lines(data_dir: str, crawler_id: str) -> int:
+    path = crawler_queue_path(data_dir, crawler_id)
+    if not os.path.exists(path):
+        return 0
+    n = 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    n += 1
+    except OSError:
+        return 0
+    return n
+
+
+def peek_crawler_queue_snapshot(
+    data_dir: str, crawler_id: str, limit: int = 40,
+) -> list[dict[str, Any]]:
+    """Return up to *limit* parsed task dicts from the queue file."""
+    rows = load_crawler_queue_snapshot(data_dir, crawler_id)
+    return rows[:limit]
+
+
+def append_crawler_log_line(
+    data_dir: str, crawler_id: str, timestamp: int, message: str,
+) -> None:
+    """Append one log line (tab-separated timestamp and message)."""
+    path = crawler_log_path(data_dir, crawler_id)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    safe = message.replace("\n", " ").replace("\r", "")
+    line = f"{timestamp}\t{safe}\n"
+    with _LOG_APPEND_LOCK:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+
+
+def delete_crawler_log_file(data_dir: str, crawler_id: str) -> None:
+    try:
+        os.remove(crawler_log_path(data_dir, crawler_id))
+    except FileNotFoundError:
+        pass
+
+
+def clear_crawler_auxiliary_files(data_dir: str) -> int:
+    """Remove all ``*.queue`` and ``*.logs`` under *data_dir*. Returns count removed."""
+    removed = 0
+    if not os.path.isdir(data_dir):
+        return removed
+    for name in os.listdir(data_dir):
+        if name.endswith(".queue") or name.endswith(".logs"):
+            try:
+                os.remove(os.path.join(data_dir, name))
+                removed += 1
+            except FileNotFoundError:
+                pass
+    return removed

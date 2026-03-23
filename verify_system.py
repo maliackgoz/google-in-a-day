@@ -243,7 +243,10 @@ def section_indexer(base: str, data_dir: str) -> None:
     check(len(parts) == 2, f"ID has two parts separated by _ (got {len(parts)} parts)")
     if len(parts) == 2:
         check(parts[0].isdigit(), "First part is epoch timestamp")
-        check(parts[1].isdigit(), "Second part is thread ID")
+        check(
+            len(parts[1]) >= 8 and all(c in "0123456789abcdef" for c in parts[1]),
+            "Second part is random hex suffix",
+        )
 
     finished = _wait_for_job(manager, cid, timeout=20)
     check(finished, "Crawler completes without hanging")

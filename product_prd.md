@@ -19,7 +19,7 @@ End your structured review with: VERDICT: ARCHITECTURE_ALIGNS_WITH_PRD — when 
 **Goal**:  
 Build a functional, small-scale web crawler and real-time search engine—"Google in a Day"—that can:
 - Crawl the web starting from one or more origin URLs.
-- Maintain a live, in-memory index of discovered pages.
+- Maintain a live index of discovered pages (persisted incrementally to disk under appropriate locking, so search reflects new pages as they are written).
 - Allow users to query the index in real time while crawling is ongoing.
 - Provide operational visibility via a simple UI or CLI dashboard.
 
@@ -71,9 +71,9 @@ The system is composed of three primary subsystems:
 
 - **Searcher (Query Engine)**  
   - Exposes a query interface (CLI and/or HTTP endpoint).
-  - Uses a thread-safe in-memory index backed by optional persistent storage.
-  - Computes relevance scores using a simple heuristic (e.g., keyword frequency and title match).
-  - Returns, for each query, a list of triples: \((relevant\_url, origin\_url, depth)\) ordered by descending relevance.
+  - Uses a thread-safe index backed by per-letter on-disk files (JSON inverted lists), read and written under locks alongside the crawler.
+  - Computes relevance scores using a deterministic composite heuristic (term frequency, exact vs prefix key match, depth penalty; optional sort by frequency or depth).
+  - Returns, for each query, a list of triples: \((relevant\_url, origin\_url, depth)\) ordered by descending relevance (default).
 
 - **System Visibility & Dashboard**  
   - Displays real-time operational metrics and status.
@@ -162,15 +162,14 @@ Cross-cutting concerns:
   - Queries MUST reflect new documents as soon as they are committed to the index (eventual but near-real-time visibility).
 
 - **FR-11: Relevance heuristic**
-  - The MVP relevance scoring MUST implement a simple, deterministic heuristic based on:
-    - Keyword frequency (term frequency) in the page content and title.
-    - Optional boosting if the query term appears in the page title.
-  - Requirements:
-    - Tokenization: case-insensitive, splitting on whitespace and punctuation.
-    - Stop words: it is acceptable to ignore stop words or to treat all terms equally in the MVP.
-    - Scoring: e.g., `score = body_term_count + alpha * title_term_count`, where alpha is a configurable constant.
+  - The MVP relevance scoring MUST implement a simple, deterministic heuristic.  The implementation MUST:
+    - Tokenize queries case-insensitively; ignore query terms shorter than two characters (noise reduction).
+    - Resolve each query term to index keys by trying an **exact** match first, then the **longest matching indexed prefix** (minimum length 3) when no exact key exists (lightweight recall without a stemmer).
+    - Aggregate matches **per URL**, summing term frequencies and a composite **relevance score** derived from: frequency weight, a bonus for exact key match, a partial-match weight for prefix resolution, and a small depth penalty.
+    - Support configurable **result ordering**: by relevance (default), by total term frequency, or by crawl depth.
+  - Indexing MUST combine tokens from page **title** and **body** (as produced by the crawler) into the same per-word postings.
   - Future extensibility:
-    - The index data model SHOULD allow adding more sophisticated ranking signals later.
+    - The index data model SHOULD allow adding more sophisticated ranking signals later (e.g., explicit title boost factor, BM25).
 
 #### 5.3 System Visibility & Dashboard
 
@@ -196,7 +195,7 @@ Cross-cutting concerns:
 
 - **FR-14: Status endpoints**
   - If a web-based dashboard is implemented, the system MUST expose:
-    - A JSON status endpoint (e.g., `/status`) returning the above metrics for easier integration and testing.
+    - A JSON status endpoint per crawl job (e.g., `/api/status/<crawler_id>`) returning the above metrics for easier integration and testing.
 
 #### 5.4 Persistence & Resumability (Bonus Requirement)
 
@@ -208,12 +207,13 @@ Cross-cutting concerns:
   - Persistence MAY be implemented using:
     - A lightweight embedded database (e.g., `sqlite3`).
     - Or structured files (e.g., JSON, CSV, or binary snapshots using `pickle`) stored periodically.
+  - **Implementation note (MVP):** Per-crawler JSON state (`[crawlerId].data`) MAY be complemented by a separate **queue snapshot file** (`[crawlerId].queue`, e.g., NDJSON) written when a job is **interrupted** (stop), so the frontier can be reloaded. Append-only per-crawler log files MAY supplement JSON for operational tailing.
 
 - **FR-16: Resuming after interruption**
-  - On startup, the system MUST be able to:
-    - Detect existing persisted state.
-    - Restore the visited set, queue, and index.
-    - Resume crawling from where it left off without re-crawling already visited URLs.
+  - The system SHOULD support:
+    - **In-process** pause/resume (frontier remains in memory).
+    - **Reload after stop:** restoring pending work from persisted queue snapshots where available, together with the global visited set and word index, so already-visited URLs are not re-fetched.
+  - A **hard process crash** MAY leave the frontier incomplete; the visited set and index still reflect completed fetches. Full reconstruction of an in-memory queue without a snapshot is a known limitation of file-only MVP persistence.
   - If no persisted state is found, the system SHOULD start a fresh crawl from configured origin URLs.
 
 ### 6. Non-Functional Requirements

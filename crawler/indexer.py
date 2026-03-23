@@ -12,9 +12,10 @@ import os
 import ssl
 import sys
 import threading
+import uuid
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from html.parser import HTMLParser
 from queue import Empty, Full, Queue
 from typing import Optional
@@ -24,7 +25,18 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from storage.file_store import CrawlerDataStore, VisitedUrlsStore, WordStore
+from storage.file_store import (
+    CrawlerDataStore,
+    VisitedUrlsStore,
+    WordStore,
+    append_crawler_log_line,
+    clear_crawler_auxiliary_files,
+    count_crawler_queue_lines,
+    delete_crawler_queue_file,
+    load_crawler_queue_snapshot,
+    peek_crawler_queue_snapshot,
+    save_crawler_queue_snapshot,
+)
 from utils import extract_title_and_content, normalize_url, tokenize
 
 logger = logging.getLogger(__name__)
@@ -95,6 +107,14 @@ class UrlQueue:
         except Empty:
             return None
 
+    def try_put_nowait(self, task: CrawlTask) -> bool:
+        """Non-blocking put.  Returns ``False`` when the queue is full."""
+        try:
+            self._queue.put_nowait(task)
+            return True
+        except Full:
+            return False
+
     def task_done(self) -> None:
         self._queue.task_done()
 
@@ -124,11 +144,11 @@ class LinkExtractor(HTMLParser):
 
 
 # ---------------------------------------------------------------------------
-# CrawlerJob — one crawl operation identified by [EpochTime_ThreadID]
+# CrawlerJob — one crawl operation identified by EpochTime_randomhex
 # ---------------------------------------------------------------------------
 
 class CrawlerJob:
-    """A single crawl job with a unique ID in the format ``EpochTime_ThreadID``.
+    """A single crawl job with a unique ID in the format ``EpochTime_randomhex``.
 
     On ``start()`` a main thread is spawned which seeds the URL queue and
     launches *max_workers* fetch workers.  Workers share the global
@@ -164,6 +184,9 @@ class CrawlerJob:
         self._visited_store = visited_store
         self._word_store = word_store
         self._crawler_store = crawler_store
+        self._data_dir = crawler_store.data_dir
+        self._resume_mode = False
+        self._resume_tasks: list[CrawlTask] = []
 
         self.queue = UrlQueue(maxsize=max_queue_size)
         self._stop_event = threading.Event()
@@ -192,22 +215,116 @@ class CrawlerJob:
         self._state_lock = threading.Lock()
 
         self._created_at = int(time.time())
+        self._completed_at: Optional[int] = None
         self.crawler_id: str = ""
         self.status: str = "pending"
 
     # -- public API ---------------------------------------------------------
 
-    def start(self) -> str:
-        """Start the crawl.  Returns the crawler ID."""
+    def start(
+        self,
+        manager: Optional["CrawlerManager"] = None,
+        *,
+        resume: bool = False,
+    ) -> str:
+        """Start the crawl.  Returns the crawler ID.
+
+        Pass ``resume=True`` only for jobs rebuilt via ``resume_from_disk``,
+        which already have ``crawler_id`` and on-disk configuration.
+
+        For new jobs, pass ``manager`` so the job is registered before the main
+        thread starts; otherwise another HTTP worker can handle pause/stop
+        before :meth:`CrawlerManager.create_job` inserts the job into ``_jobs``.
+        """
+        if resume:
+            if not self.crawler_id:
+                raise ValueError("resume start requires crawler_id")
+            self._main_thread = threading.Thread(target=self._run_main, daemon=True)
+            self._main_thread.start()
+            self.status = "running"
+            pending_n = len(self._resume_tasks)
+            ov = getattr(self, "_resume_omitted_visited", 0)
+            od = getattr(self, "_resume_omitted_snapshot_dup", 0)
+            msg = f"Resumed from disk — {pending_n} URL(s) queued to fetch"
+            if ov or od:
+                msg += f" ({ov} already visited"
+                if od:
+                    msg += f", {od} duplicate line(s) in snapshot file"
+                msg += " omitted)"
+            self._add_log(msg)
+            self._save_state()
+            return self.crawler_id
+
         self._id_ready = threading.Event()
+        # ID before thread start so the manager can register the job immediately;
+        # ``ThreadingHTTPServer`` can otherwise serve /pause before ``_jobs`` is updated.
+        self.crawler_id = f"{self._created_at}_{uuid.uuid4().hex[:10]}"
+        self.status = "running"
+        if manager is not None:
+            with manager._lock:
+                manager._jobs[self.crawler_id] = self
         self._main_thread = threading.Thread(target=self._run_main, daemon=True)
         self._main_thread.start()
-        self.crawler_id = f"{self._created_at}_{self._main_thread.ident}"
-        self.status = "running"
         self._id_ready.set()
         self._add_log(f"Crawler started for {self.origin_url} (depth={self.max_depth})")
         self._save_state()
         return self.crawler_id
+
+    @classmethod
+    def resume_from_disk(cls, crawler_id: str, manager: "CrawlerManager") -> "CrawlerJob":
+        """Rebuild a job from ``{id}.data`` plus optional ``{id}.queue`` snapshot."""
+        raw = manager.crawler_store.read(crawler_id)
+        if not raw:
+            raise ValueError("crawler state not found")
+        if raw.get("status") == "finished":
+            raise ValueError("cannot resume a finished crawler")
+
+        rows = load_crawler_queue_snapshot(manager.crawler_store.data_dir, crawler_id)
+        tasks: list[CrawlTask] = []
+        seen_norm: set[str] = set()
+        omitted_visited = 0
+        omitted_snapshot_dup = 0
+        for row in rows:
+            try:
+                u = normalize_url(str(row["url"]))
+                ou = str(row.get("origin_url", u))
+                d = int(row.get("depth", 0))
+                if u in seen_norm:
+                    omitted_snapshot_dup += 1
+                    continue
+                seen_norm.add(u)
+                if u in manager.visited_store:
+                    omitted_visited += 1
+                    continue
+                tasks.append(CrawlTask(u, ou, d))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        job = cls(
+            origin_url=raw["origin_url"],
+            max_depth=int(raw["max_depth"]),
+            visited_store=manager.visited_store,
+            word_store=manager.word_store,
+            crawler_store=manager.crawler_store,
+            max_workers=int(raw.get("max_workers", 4)),
+            max_queue_size=int(raw.get("queue_capacity", 1000)),
+            max_pages=raw.get("max_pages"),
+            hit_rate=float(raw.get("hit_rate", 0.0)),
+            http_timeout=float(raw.get("http_timeout", 10.0)),
+        )
+        job.crawler_id = crawler_id
+        job._created_at = int(raw.get("created_at", time.time()))
+        job._resume_mode = True
+        job._resume_tasks = tasks
+        job._resume_omitted_visited = omitted_visited
+        job._resume_omitted_snapshot_dup = omitted_snapshot_dup
+        job._pages_processed = int(raw.get("pages_processed", 0))
+        job._urls_discovered = int(raw.get("urls_discovered", 0))
+        with job._logs_lock:
+            job._logs = list(raw.get("logs", []))[-2000:]
+        job._completed_at = None
+        job.status = "pending"
+        return job
 
     def join(self, timeout: float = 5.0) -> None:
         """Wait for the main crawl thread to finish."""
@@ -220,6 +337,7 @@ class CrawlerJob:
         self._pause_event.set()
         if self.status in ("running", "paused"):
             self.status = "interrupted"
+            self._completed_at = int(time.time())
             self._add_log("Crawler interrupted by user")
             self._save_state()
 
@@ -254,8 +372,14 @@ class CrawlerJob:
     # -- internal helpers ---------------------------------------------------
 
     def _add_log(self, message: str) -> None:
+        ts = int(time.time())
         with self._logs_lock:
-            self._logs.append({"timestamp": int(time.time()), "message": message})
+            self._logs.append({"timestamp": ts, "message": message})
+        if self.crawler_id:
+            try:
+                append_crawler_log_line(self._data_dir, self.crawler_id, ts, message)
+            except OSError:
+                pass
 
     def _build_state(self) -> dict:
         with self._pages_lock:
@@ -266,13 +390,23 @@ class CrawlerJob:
             active = self._active_workers
         with self._logs_lock:
             logs = list(self._logs)
+        preview: list[dict] = []
+        persisted_n = 0
+        if self.status == "interrupted" and self.crawler_id:
+            preview = peek_crawler_queue_snapshot(self._data_dir, self.crawler_id, 40)
+            persisted_n = count_crawler_queue_lines(self._data_dir, self.crawler_id)
+        now = int(time.time())
         return {
             "id": self.crawler_id,
             "origin_url": self.origin_url,
             "max_depth": self.max_depth,
+            "max_workers": self.max_workers,
+            "http_timeout": self.http_timeout,
             "hit_rate": self.hit_rate,
             "status": self.status,
             "created_at": self._created_at,
+            "updated_at": now,
+            "completed_at": self._completed_at,
             "queue_capacity": self.max_queue_size,
             "max_pages": self.max_pages,
             "pages_processed": processed,
@@ -280,6 +414,8 @@ class CrawlerJob:
             "active_workers": active,
             "queue_size": self.queue.qsize(),
             "backpressure_active": self.queue.is_at_capacity(),
+            "queue_preview": preview,
+            "persisted_queue_count": persisted_n,
             "logs": logs,
         }
 
@@ -290,11 +426,22 @@ class CrawlerJob:
     # -- main job thread ----------------------------------------------------
 
     def _run_main(self) -> None:
-        self._id_ready.wait()
+        if not self._resume_mode:
+            self._id_ready.wait()
 
-        self.queue.put(CrawlTask(self.origin_url, self.origin_url, 0))
-        with self._discovered_lock:
-            self._urls_discovered = 1
+        if self._resume_mode:
+            if self._resume_tasks:
+                for t in self._resume_tasks:
+                    if not self.queue.try_put_nowait(t):
+                        break
+                delete_crawler_queue_file(self._data_dir, self.crawler_id)
+                self._resume_tasks = []
+            else:
+                self.queue.put(CrawlTask(self.origin_url, self.origin_url, 0))
+        else:
+            self.queue.put(CrawlTask(self.origin_url, self.origin_url, 0))
+            with self._discovered_lock:
+                self._urls_discovered = 1
 
         for i in range(self.max_workers):
             t = threading.Thread(
@@ -309,9 +456,32 @@ class CrawlerJob:
 
         if self.status in ("running", "pending"):
             self.status = "finished"
+            self._completed_at = int(time.time())
             self._add_log("Crawler finished")
+            delete_crawler_queue_file(self._data_dir, self.crawler_id)
+        elif self.status == "interrupted":
+            self._persist_unserved_queue_to_disk()
+
         self._save_state()
         self._visited_store.save()
+
+    def _persist_unserved_queue_to_disk(self) -> None:
+        """Drain the in-memory queue after workers stop; persist for resume."""
+        pending: list[CrawlTask] = []
+        while True:
+            t = self.queue.try_get_nowait()
+            if t is None:
+                break
+            pending.append(t)
+        if pending:
+            save_crawler_queue_snapshot(
+                self._data_dir,
+                self.crawler_id,
+                [asdict(x) for x in pending],
+            )
+            self._add_log(f"Saved {len(pending)} pending URL(s) for resume")
+        else:
+            delete_crawler_queue_file(self._data_dir, self.crawler_id)
 
     def _wait_for_completion(self) -> None:
         """Block until workers drain the queue or stop is signalled.
@@ -321,10 +491,17 @@ class CrawlerJob:
         if a worker is stuck in a slow/hanging HTTP request.
         """
         idle_rounds = 0
+        stall_rounds = 0
         while not self._stop_event.is_set():
             time.sleep(0.5)
 
-            if all(not t.is_alive() for t in self._workers):
+            alive = sum(1 for t in self._workers if t.is_alive())
+            if alive == 0:
+                remaining = self.queue.qsize()
+                if remaining:
+                    self._add_log(
+                        f"All workers exited with {remaining} task(s) still queued"
+                    )
                 break
 
             with self._active_workers_lock:
@@ -338,6 +515,17 @@ class CrawlerJob:
             else:
                 idle_rounds = 0
 
+            if active == 0 and not q_empty and not_paused:
+                stall_rounds += 1
+                if stall_rounds >= 20:
+                    self._add_log(
+                        f"Workers stalled: {alive} alive, 0 active, "
+                        f"{self.queue.qsize()} queued — stopping"
+                    )
+                    break
+            else:
+                stall_rounds = 0
+
         self._stop_event.set()
         deadline = time.time() + 3
         for t in self._workers:
@@ -347,25 +535,15 @@ class CrawlerJob:
     # -- worker loop --------------------------------------------------------
 
     def _worker_loop(self) -> None:
-        idle_ticks = 0
+        # Do not exit on an empty queue; only _wait_for_completion sets _stop_event.
         while not self._stop_event.is_set():
             if not self._pause_event.is_set():
-                idle_ticks = 0
                 self._pause_event.wait(timeout=0.5)
                 continue
             task = self.queue.try_get_nowait()
             if task is None:
-                with self._active_workers_lock:
-                    peers_busy = self._active_workers > 0
-                if peers_busy:
-                    idle_ticks = 0
-                else:
-                    idle_ticks += 1
-                    if idle_ticks > 60:
-                        return
                 self._stop_event.wait(0.05)
                 continue
-            idle_ticks = 0
             with self._active_workers_lock:
                 self._active_workers += 1
             try:
@@ -378,6 +556,8 @@ class CrawlerJob:
                         if self._pages_processed >= self.max_pages:
                             self._stop_event.set()
                             return
+            except Exception as exc:
+                self._add_log(f"Worker error processing {task.url}: {exc}")
             finally:
                 with self._active_workers_lock:
                     self._active_workers -= 1
@@ -401,24 +581,38 @@ class CrawlerJob:
         if html is None:
             return
 
+        if len(html) > self._MAX_PARSE_BYTES:
+            self._add_log(
+                f"Truncating HTML to {self._MAX_PARSE_BYTES // 1024} KiB "
+                f"({len(html)} bytes) for {task.url}"
+            )
+            html = html[: self._MAX_PARSE_BYTES]
+
         title, content = extract_title_and_content(html)
+        title = title[:2000]
+        if len(content) > self._MAX_TEXT_CHARS:
+            content = content[: self._MAX_TEXT_CHARS]
         word_counts = Counter(tokenize(content) + tokenize(title))
+        if len(word_counts) > self._MAX_INDEX_TERMS:
+            word_counts = Counter(dict(word_counts.most_common(self._MAX_INDEX_TERMS)))
         if word_counts:
             self._word_store.add_words(
                 word_counts, task.url, task.origin_url, task.depth,
             )
 
         if task.depth < self.max_depth:
-            for link in self._extract_links(task.url, html):
-                if link in self._visited_store:
-                    continue
+            raw_links = self._extract_links(task.url, html)
+            candidates = self._visited_store.filter_unvisited(raw_links)
+            if len(candidates) > self._MAX_OUTLINKS_PER_PAGE:
+                candidates = candidates[: self._MAX_OUTLINKS_PER_PAGE]
+            for link in candidates:
+                if self._stop_event.is_set():
+                    break
                 new_task = CrawlTask(link, task.origin_url, task.depth + 1)
-                if not self.queue.put_with_backpressure(new_task, self._stop_event):
-                    if self._stop_event.is_set():
-                        break
-                else:
-                    with self._discovered_lock:
-                        self._urls_discovered += 1
+                if not self.queue.try_put_nowait(new_task):
+                    break
+                with self._discovered_lock:
+                    self._urls_discovered += 1
 
         with self._pages_lock:
             should_save = self._pages_processed % 10 == 0
@@ -447,6 +641,16 @@ class CrawlerJob:
         time.sleep(sleep_for)
 
     _MAX_RESPONSE_BYTES = 5 * 1024 * 1024  # 5 MB
+    # Parsing/indexing very large HTML (e.g. Wikipedia) can take minutes on one CPU-bound
+    # thread with no further "Fetching" logs; cap bytes fed to HTMLParser and WordStore.
+    _MAX_PARSE_BYTES = 512 * 1024  # 512 KiB
+    # WordStore rewrites one JSON file per letter touched; huge pages + large indexes
+    # can spend minutes per page with no further logs. Bound text and distinct terms.
+    _MAX_TEXT_CHARS = 350_000
+    _MAX_INDEX_TERMS = 5_000
+    # Wikipedia Main Page can expose 10k+ hrefs; checking each with ``in visited`` took a
+    # lock per link. Batch-filter instead and cap how many we enqueue per page.
+    _MAX_OUTLINKS_PER_PAGE = 500
 
     def _fetch_html(self, url: str) -> Optional[str]:
         if self._stop_event.is_set():
@@ -550,10 +754,7 @@ class CrawlerManager:
             hit_rate=hit_rate,
             http_timeout=http_timeout,
         )
-        crawler_id = job.start()
-        with self._lock:
-            self._jobs[crawler_id] = job
-        return crawler_id
+        return job.start(manager=self)
 
     def get_job(self, crawler_id: str) -> Optional[CrawlerJob]:
         with self._lock:
@@ -565,7 +766,25 @@ class CrawlerManager:
             job = self._jobs.get(crawler_id)
         if job:
             return job.get_status()
-        return self.crawler_store.read(crawler_id)
+        data = self.crawler_store.read(crawler_id)
+        if not data:
+            return None
+        out = dict(data)
+        if out.get("status") == "interrupted":
+            out["queue_preview"] = peek_crawler_queue_snapshot(
+                self.crawler_store.data_dir, crawler_id, 40,
+            )
+            out["persisted_queue_count"] = count_crawler_queue_lines(
+                self.crawler_store.data_dir, crawler_id,
+            )
+        else:
+            out.setdefault("queue_preview", [])
+            out.setdefault("persisted_queue_count", 0)
+        out.setdefault("max_workers", 4)
+        out.setdefault("http_timeout", 10.0)
+        out.setdefault("updated_at", out.get("created_at"))
+        out.setdefault("completed_at", None)
+        return out
 
     def list_jobs(self) -> list[dict]:
         """All jobs: prefer live status for running ones, disk for historical."""
@@ -610,6 +829,20 @@ class CrawlerManager:
             return True
         return False
 
+    def resume_job_from_disk(self, crawler_id: str) -> bool:
+        """Restart an interrupted crawler using ``{id}.data`` and ``{id}.queue``."""
+        with self._lock:
+            existing = self._jobs.get(crawler_id)
+            if existing and existing.is_running:
+                return False
+            try:
+                job = CrawlerJob.resume_from_disk(crawler_id, self)
+            except ValueError:
+                return False
+            self._jobs[crawler_id] = job
+        job.start(resume=True)
+        return True
+
     # -- statistics ---------------------------------------------------------
 
     def get_statistics(self) -> dict:
@@ -635,9 +868,10 @@ class CrawlerManager:
                     job.stop()
             self._jobs.clear()
         removed = self.crawler_store.clear_all()
+        aux = clear_crawler_auxiliary_files(self._data_dir)
         self.visited_store.clear()
         self.word_store.clear()
-        return {"cleared": True, "files_removed": removed}
+        return {"cleared": True, "files_removed": removed + aux}
 
     def shutdown(self) -> None:
         """Stop all running jobs, wait for them to finish, persist visited URLs."""

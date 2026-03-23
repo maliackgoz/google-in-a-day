@@ -2,14 +2,11 @@
 """Google in a Day — start the web server.
 
 Usage:
-  python3 run.py                        # default: http://localhost:8080
-  python3 run.py --port 9090            # custom port
-  python3 run.py --data-dir /tmp/crawl  # custom data directory
+  python3 run.py      # http://localhost:8080
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
 import os
 import sys
@@ -26,35 +23,24 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
+PORT = 8080
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Google in a Day — Web Crawler & Search Engine",
-    )
-    parser.add_argument(
-        "--port", "-p", type=int, default=8080,
-        help="HTTP server port (default: 8080)",
-    )
-    parser.add_argument(
-        "--data-dir", "-d", type=str, default="data",
-        help="Data directory for storage files (default: data)",
-    )
-    args = parser.parse_args()
+    os.makedirs(DATA_DIR, exist_ok=True)
 
-    data_dir = os.path.join(PROJECT_ROOT, args.data_dir)
-    os.makedirs(data_dir, exist_ok=True)
-
-    manager = CrawlerManager(data_dir)
+    manager = CrawlerManager(DATA_DIR)
     searcher = Searcher(manager.word_store)
 
     print("=" * 52)
     print("  Google in a Day — Web Crawler & Search Engine")
     print("=" * 52)
-    print(f"  Data directory: {data_dir}")
+    print(f"  Data directory: {DATA_DIR}")
     print()
 
     try:
-        start_server(manager, searcher, port=args.port)
+        start_server(manager, searcher, port=PORT)
     finally:
         print("\nShutting down...")
         manager.shutdown()
