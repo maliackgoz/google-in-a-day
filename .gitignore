@@ -3,4 +3,4 @@ __pycache__/
 *.pyo
 .venv/
 crawl_state.db
-data/
+.DS_Store

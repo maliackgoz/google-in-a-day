@@ -840,7 +840,7 @@ def start_server(
     manager: "CrawlerManager",
     searcher: "Searcher",
     host: str = "0.0.0.0",
-    port: int = 8080,
+    port: int = 3600,
 ) -> None:
     """Start the HTTP server and block until interrupted.
 

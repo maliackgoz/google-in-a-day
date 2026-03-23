@@ -58,7 +58,7 @@ Search uses the same on-disk word index the crawler updates while jobs run. Ther
 python3 run.py
 ```
 
-Then open [http://localhost:8080](http://localhost:8080) in your browser.
+Then open [http://localhost:3600](http://localhost:3600) in your browser.
 
 ---
 

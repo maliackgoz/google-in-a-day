@@ -1,0 +1,155 @@
+{
+  "id": "1774293976_920af931ab",
+  "origin_url": "https://en.wikipedia.org/wiki/Web_crawler",
+  "max_depth": 2,
+  "max_workers": 4,
+  "http_timeout": 10.0,
+  "hit_rate": 0.0,
+  "status": "finished",
+  "created_at": 1774293976,
+  "updated_at": 1774293984,
+  "completed_at": 1774293984,
+  "queue_capacity": 1000,
+  "max_pages": 30,
+  "pages_processed": 30,
+  "urls_discovered": 1030,
+  "active_workers": 0,
+  "queue_size": 1000,
+  "backpressure_active": true,
+  "queue_preview": [],
+  "persisted_queue_count": 0,
+  "logs": [
+    {
+      "timestamp": 1774293976,
+      "message": "Crawler started for https://en.wikipedia.org/wiki/Web_crawler (depth=2)"
+    },
+    {
+      "timestamp": 1774293976,
+      "message": "Fetching https://en.wikipedia.org/wiki/Web_crawler (depth=0)"
+    },
+    {
+      "timestamp": 1774293977,
+      "message": "Fetching https://en.wikipedia.org/wiki/Main_Page (depth=1)"
+    },
+    {
+      "timestamp": 1774293977,
+      "message": "Fetching https://en.wikipedia.org/wiki/Wikipedia:Contents (depth=1)"
+    },
+    {
+      "timestamp": 1774293977,
+      "message": "Fetching https://en.wikipedia.org/wiki/Portal:Current_events (depth=1)"
+    },
+    {
+      "timestamp": 1774293977,
+      "message": "Fetching https://en.wikipedia.org/wiki/Special:Random (depth=1)"
+    },
+    {
+      "timestamp": 1774293977,
+      "message": "Fetching https://en.wikipedia.org/wiki/Wikipedia:About (depth=1)"
+    },
+    {
+      "timestamp": 1774293977,
+      "message": "Fetching https://en.wikipedia.org/wiki/Wikipedia:Contact_us (depth=1)"
+    },
+    {
+      "timestamp": 1774293977,
+      "message": "Fetching https://en.wikipedia.org/wiki/Help:Contents (depth=1)"
+    },
+    {
+      "timestamp": 1774293978,
+      "message": "Fetching https://en.wikipedia.org/wiki/Help:Introduction (depth=1)"
+    },
+    {
+      "timestamp": 1774293978,
+      "message": "Fetching https://en.wikipedia.org/wiki/Wikipedia:Community_portal (depth=1)"
+    },
+    {
+      "timestamp": 1774293978,
+      "message": "Fetching https://en.wikipedia.org/wiki/Special:RecentChanges (depth=1)"
+    },
+    {
+      "timestamp": 1774293978,
+      "message": "Fetching https://en.wikipedia.org/wiki/Wikipedia:File_upload_wizard (depth=1)"
+    },
+    {
+      "timestamp": 1774293978,
+      "message": "Fetching https://en.wikipedia.org/wiki/Special:SpecialPages (depth=1)"
+    },
+    {
+      "timestamp": 1774293979,
+      "message": "Fetching https://en.wikipedia.org/wiki/Special:Search (depth=1)"
+    },
+    {
+      "timestamp": 1774293979,
+      "message": "Truncating HTML to 512 KiB (576031 bytes) for https://en.wikipedia.org/wiki/Wikipedia:Community_portal"
+    },
+    {
+      "timestamp": 1774293979,
+      "message": "Fetching https://donate.wikimedia.org/?wmf_source=donate&wmf_medium=sidebar&wmf_campaign=en.wikipedia.org&uselang=en (depth=1)"
+    },
+    {
+      "timestamp": 1774293979,
+      "message": "Fetching https://en.wikipedia.org/w/index.php?title=Special:CreateAccount&returnto=Web+crawler (depth=1)"
+    },
+    {
+      "timestamp": 1774293979,
+      "message": "Fetching https://en.wikipedia.org/w/index.php?title=Special:UserLogin&returnto=Web+crawler (depth=1)"
+    },
+    {
+      "timestamp": 1774293979,
+      "message": "Fetching https://af.wikipedia.org/wiki/Webkruiper (depth=1)"
+    },
+    {
+      "timestamp": 1774293980,
+      "message": "Fetching https://ar.wikipedia.org/wiki/%D8%B2%D8%A7%D8%AD%D9%81_%D9%88%D9%8A%D8%A8 (depth=1)"
+    },
+    {
+      "timestamp": 1774293981,
+      "message": "Fetching https://ary.wikipedia.org/wiki/%D8%B1%D8%AA%D9%8A%D9%84%D8%A9_(%D8%A8%D9%88%D8%AA) (depth=1)"
+    },
+    {
+      "timestamp": 1774293981,
+      "message": "Fetching https://az.wikipedia.org/wiki/Axtar%C4%B1%C5%9F_botu (depth=1)"
+    },
+    {
+      "timestamp": 1774293981,
+      "message": "Fetching https://bar.wikipedia.org/wiki/Webcrawler (depth=1)"
+    },
+    {
+      "timestamp": 1774293982,
+      "message": "Fetching https://ca.wikipedia.org/wiki/Aranya_web (depth=1)"
+    },
+    {
+      "timestamp": 1774293982,
+      "message": "Fetching https://ckb.wikipedia.org/wiki/%D9%88%DB%8E%D8%A8_%DA%A9%D8%B1%D8%A7%D9%88%D9%84%DB%95%D8%B1 (depth=1)"
+    },
+    {
+      "timestamp": 1774293982,
+      "message": "Fetching https://cs.wikipedia.org/wiki/Web_crawler (depth=1)"
+    },
+    {
+      "timestamp": 1774293982,
+      "message": "Fetching https://cy.wikipedia.org/wiki/Ymgripiwr_gwe (depth=1)"
+    },
+    {
+      "timestamp": 1774293982,
+      "message": "Fetching https://de.wikipedia.org/wiki/Webcrawler (depth=1)"
+    },
+    {
+      "timestamp": 1774293982,
+      "message": "Fetching https://el.wikipedia.org/wiki/%CE%91%CE%BD%CE%B9%CF%87%CE%BD%CE%B5%CF%85%CF%84%CE%AE%CF%82_%CE%B9%CF%83%CF%84%CE%BF%CF%8D (depth=1)"
+    },
+    {
+      "timestamp": 1774293983,
+      "message": "Fetching https://es.wikipedia.org/wiki/Ara%C3%B1a_web (depth=1)"
+    },
+    {
+      "timestamp": 1774293983,
+      "message": "Fetching https://et.wikipedia.org/wiki/Veebi%C3%A4mblik (depth=1)"
+    },
+    {
+      "timestamp": 1774293984,
+      "message": "Crawler finished"
+    }
+  ]
+}

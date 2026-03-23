@@ -2,7 +2,7 @@
 """Google in a Day — start the web server.
 
 Usage:
-  python3 run.py      # http://localhost:8080
+  python3 run.py      # http://localhost:3600
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-PORT = 8080
+PORT = 3600
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
 
